@@ -34,14 +34,22 @@ async def youtube_login(
             detail="Video record was not found.",
         )
 
-    if redirect_url and not (
-        redirect_url.startswith("http://localhost:5173/")
-        or redirect_url.startswith("http://127.0.0.1:5173/")
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="redirect_url must start with http://localhost:5173/ or http://127.0.0.1:5173/",
-        )
+    if redirect_url:
+        # Allow any http or https redirect (useful when frontend is deployed on a remote host or IP)
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(redirect_url)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid redirect_url",
+            )
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="redirect_url must be an absolute http or https URL",
+            )
 
     state_payload = encode_oauth_state(video_id=video_id, redirect_url=redirect_url)
     auth_url, state = generate_auth_url(state_payload)
