@@ -1,5 +1,9 @@
+"""
+Campaign routes — CRUD, dashboard, video detail, comparison.
+"""
+
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.responses import JSONResponse
@@ -10,16 +14,23 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import get_db, get_current_user
 from app.core.logger import get_logger
 from app.models.campaign import Campaign
-from app.models.daily_stat import DailyStat
 from app.models.user import User
 from app.models.video_metric import VideoMetric
 from app.schemas.campaign import CampaignCreate, CampaignDashboardResponse, CampaignRead
 from app.schemas.video_metric import (
     DashboardVideoItem,
+    EngagementMetrics,
+    InteractiveMetrics,
+    MonetizationMetrics,
     PrivateMetrics,
     PublicMetrics,
+    VideoComparisonItem,
+    VideoDetailResponse,
+    VideoMetadata,
     VideoMetricCreate,
     VideoMetricRead,
+    ViewsReachMetrics,
+    WatchTimeMetrics,
 )
 from app.services.youtube import extract_video_id_from_url
 from app.services.youtube_analytics import fetch_retention_data
@@ -27,6 +38,179 @@ from app.services.youtube_analytics import fetch_retention_data
 router = APIRouter(prefix="/campaigns", tags=["Campaign Management"])
 logger = get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers: build response objects from cache blob
+# ---------------------------------------------------------------------------
+
+def _build_dashboard_item(video: VideoMetric, metrics: dict) -> DashboardVideoItem:
+    """Build a DashboardVideoItem from a VideoMetric + analytics blob."""
+    ps = metrics.get("public_stats", {})
+    engagement = metrics.get("engagement", {})
+    retention_points = list(metrics.get("retention_points") or [])
+
+    return DashboardVideoItem(
+        video_record_id=video.id,
+        video_id=video.video_id,
+        youtube_url=video.youtube_url,
+        title=video.title or (metrics.get("metadata", {}) or {}).get("title"),
+        channel_title=video.channel_title or (metrics.get("metadata", {}) or {}).get("channel_title"),
+        duration_seconds=ps.get("duration_seconds"),
+        ad_start_seconds=video.ad_start_seconds,
+        ad_end_seconds=video.ad_end_seconds,
+        is_authorized=video.is_authorized,
+        public_metrics=PublicMetrics(
+            total_views=_int_or_none(ps.get("view_count")),
+            likes=_int_or_none(ps.get("like_count")),
+            comments=_int_or_none(ps.get("comment_count")),
+            favorites=_int_or_none(ps.get("favorite_count")),
+            upload_date=_parse_dt(ps.get("upload_date")),
+            subscriber_count=_int_or_none(ps.get("subscriber_count")),
+        ),
+        private_metrics=PrivateMetrics(
+            retention_at_start=_float_or_none(metrics.get("retention_at_ad_start")),
+            retention_at_ad_start=_float_or_none(metrics.get("retention_at_ad_start")),
+            retention_data=retention_points,
+        ),
+    )
+
+
+def _build_detail_response(video: VideoMetric, metrics: dict) -> VideoDetailResponse:
+    """Build a full VideoDetailResponse from a VideoMetric + analytics blob."""
+    meta = metrics.get("metadata", {}) or {}
+    vr = metrics.get("views_reach", {}) or {}
+    wt = metrics.get("watch_time", {}) or {}
+    mon = metrics.get("monetization", {}) or {}
+    eng = metrics.get("engagement", {}) or {}
+    inter = metrics.get("interactive", {}) or {}
+    retention_points = list(metrics.get("retention_points") or [])
+
+    return VideoDetailResponse(
+        video_record_id=video.id,
+        video_id=video.video_id,
+        youtube_url=video.youtube_url,
+        campaign_id=video.campaign_id,
+        ad_start_seconds=video.ad_start_seconds,
+        ad_end_seconds=video.ad_end_seconds,
+        is_authorized=video.is_authorized,
+        last_updated=video.last_updated,
+        metadata=VideoMetadata(
+            title=meta.get("title"),
+            description=meta.get("description"),
+            channel_id=meta.get("channel_id"),
+            channel_title=meta.get("channel_title"),
+            duration_seconds=meta.get("duration_seconds"),
+            published_at=meta.get("published_at"),
+            privacy_status=meta.get("privacy_status"),
+        ),
+        views_reach=ViewsReachMetrics(
+            total_views=_int_or_none(vr.get("views")),
+            uniques=_int_or_none(vr.get("uniques")),
+            engaged_views=_int_or_none(vr.get("engaged_views")),
+            thumbnail_impressions=_int_or_none(vr.get("thumbnail_impressions")),
+            thumbnail_ctr=_float_or_none(vr.get("thumbnail_ctr")),
+        ),
+        watch_time=WatchTimeMetrics(
+            estimated_minutes_watched=_float_or_none(wt.get("estimated_minutes_watched")),
+            average_view_duration=_float_or_none(wt.get("average_view_duration")),
+            average_view_percentage=_float_or_none(wt.get("average_view_percentage")),
+        ),
+        monetization=MonetizationMetrics(
+            estimated_revenue=_float_or_none(mon.get("estimated_revenue")),
+            estimated_ad_revenue=_float_or_none(mon.get("estimated_ad_revenue")),
+            ad_impressions=_int_or_none(mon.get("ad_impressions")),
+            monetized_playbacks=_int_or_none(mon.get("monetized_playbacks")),
+            playback_based_cpm=_float_or_none(mon.get("playback_based_cpm")),
+            cpm=_float_or_none(mon.get("cpm")),
+        ),
+        engagement=EngagementMetrics(
+            likes=_int_or_none(eng.get("likes")),
+            dislikes=_int_or_none(eng.get("dislikes")),
+            comments=_int_or_none(eng.get("comments")),
+            shares=_int_or_none(eng.get("shares")),
+            subscribers_gained=_int_or_none(eng.get("subscribers_gained")),
+            subscribers_lost=_int_or_none(eng.get("subscribers_lost")),
+        ),
+        interactive=InteractiveMetrics(
+            cards_impressions=_int_or_none(inter.get("cards_impressions")),
+            cards_click_rate=_float_or_none(inter.get("cards_click_rate")),
+            end_screen_click_rate=_float_or_none(inter.get("end_screen_click_rate")),
+        ),
+        retention=PrivateMetrics(
+            retention_at_start=_float_or_none(metrics.get("retention_at_ad_start")),
+            retention_at_ad_start=_float_or_none(metrics.get("retention_at_ad_start")),
+            retention_data=retention_points,
+        ),
+    )
+
+
+def _build_comparison_item(video: VideoMetric, metrics: dict) -> VideoComparisonItem:
+    """Build a flat comparison row."""
+    ps = metrics.get("public_stats", {}) or {}
+    vr = metrics.get("views_reach", {}) or {}
+    wt = metrics.get("watch_time", {}) or {}
+    mon = metrics.get("monetization", {}) or {}
+    eng = metrics.get("engagement", {}) or {}
+    meta = metrics.get("metadata", {}) or {}
+
+    return VideoComparisonItem(
+        video_id=video.video_id,
+        title=video.title or meta.get("title"),
+        channel_title=video.channel_title or meta.get("channel_title"),
+        duration_seconds=ps.get("duration_seconds"),
+        total_views=_int_or_none(vr.get("views") or ps.get("view_count")),
+        uniques=_int_or_none(vr.get("uniques")),
+        likes=_int_or_none(eng.get("likes") or ps.get("like_count")),
+        dislikes=_int_or_none(eng.get("dislikes")),
+        comments=_int_or_none(eng.get("comments") or ps.get("comment_count")),
+        shares=_int_or_none(eng.get("shares")),
+        subscriber_count=_int_or_none(ps.get("subscriber_count")),
+        estimated_minutes_watched=_float_or_none(wt.get("estimated_minutes_watched")),
+        average_view_duration=_float_or_none(wt.get("average_view_duration")),
+        average_view_percentage=_float_or_none(wt.get("average_view_percentage")),
+        estimated_revenue=_float_or_none(mon.get("estimated_revenue")),
+        ad_impressions=_int_or_none(mon.get("ad_impressions")),
+        cpm=_float_or_none(mon.get("cpm")),
+        retention_at_ad_start=_float_or_none(metrics.get("retention_at_ad_start")),
+        subscribers_gained=_int_or_none(eng.get("subscribers_gained")),
+        subscribers_lost=_int_or_none(eng.get("subscribers_lost")),
+    )
+
+
+def _int_or_none(val) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _float_or_none(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_dt(val) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str) and val:
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @router.get("", response_model=list[CampaignRead])
 async def list_campaigns(
@@ -46,7 +230,7 @@ async def create_campaign(
     current_user: User = Depends(get_current_user),
 ) -> Campaign:
     logger.info(f"User {current_user.id} creating campaign: {payload.title}")
-    campaign = Campaign(owner_id=current_user.id, title=payload.title)
+    campaign = Campaign(owner_id=current_user.id, title=payload.title, video_quantity=0)
     db.add(campaign)
     await db.commit()
     await db.refresh(campaign)
@@ -96,6 +280,10 @@ async def add_video_to_campaign(
         ad_end_seconds=payload.ad_end_seconds,
     )
     db.add(video_metric)
+
+    # Increment denormalized counter
+    campaign.video_quantity = (campaign.video_quantity or 0) + 1
+
     await db.commit()
     await db.refresh(video_metric)
 
@@ -124,107 +312,26 @@ async def get_campaign_dashboard(
         )
 
     dashboard_items: list[DashboardVideoItem] = []
-    today = date.today()
 
     for video in campaign.videos:
         try:
+            logger.info(f"[DASHBOARD] Processing video: {video.video_id} (authorized={video.is_authorized})")
             metrics = await fetch_retention_data(
                 video.video_id,
                 db=db,
                 preloaded_video=video,
             )
-        except Exception:
+            logger.info(f"[DASHBOARD] ✅ Got metrics for {video.video_id}: views={metrics.get('public_stats', {}).get('view_count')}")
+        except Exception as exc:
+            logger.error(f"[DASHBOARD] ❌ EXCEPTION for video {video.video_id}: {type(exc).__name__}: {exc}", exc_info=True)
             metrics = {
-                "total_views": None,
-                "likes": None,
-                "retention_at_start": None,
+                "public_stats": {},
+                "metadata": {},
                 "retention_points": [],
+                "retention_at_ad_start": None,
             }
 
-        if metrics.get("total_views") is None and metrics.get("retention_at_start") is None:
-            cached_stat = await db.scalar(
-                select(DailyStat)
-                .where(DailyStat.video_id == video.id)
-                .order_by(DailyStat.date.desc())
-                .limit(1)
-            )
-            if cached_stat is not None:
-                metrics["total_views"] = cached_stat.total_views
-                metrics["retention_at_start"] = cached_stat.retention_at_ad_start
-
-        if metrics.get("total_views") is not None or metrics.get("retention_at_start") is not None:
-            stat = await db.scalar(
-                select(DailyStat).where(
-                    DailyStat.video_id == video.id,
-                    DailyStat.date == today,
-                )
-            )
-            if stat is None:
-                stat = DailyStat(
-                    video_id=video.id,
-                    date=today,
-                    total_views=int(metrics.get("total_views") or 0),
-                    retention_at_ad_start=(
-                        float(metrics["retention_at_start"])
-                        if metrics.get("retention_at_start") is not None
-                        else None
-                    ),
-                )
-                db.add(stat)
-            else:
-                if metrics.get("total_views") is not None:
-                    stat.total_views = int(metrics["total_views"])
-                if metrics.get("retention_at_start") is not None:
-                    stat.retention_at_ad_start = float(metrics["retention_at_start"])
-
-        dashboard_items.append(
-            DashboardVideoItem(
-                video_record_id=video.id,
-                video_id=video.video_id,
-                youtube_url=video.youtube_url,
-                duration_seconds=(
-                    int(metrics["duration_seconds"])
-                    if metrics.get("duration_seconds") is not None
-                    else None
-                ),
-                ad_start_seconds=video.ad_start_seconds,
-                ad_end_seconds=video.ad_end_seconds,
-                is_authorized=video.is_authorized,
-                public_metrics=PublicMetrics(
-                    total_views=(int(metrics["total_views"]) if metrics.get("total_views") is not None else None),
-                    likes=(int(metrics["likes"]) if metrics.get("likes") is not None else None),
-                    comments=(int(metrics["comments"]) if metrics.get("comments") is not None else None),
-                    favorites=(int(metrics["favorites"]) if metrics.get("favorites") is not None else None),
-                    upload_date=(
-                        metrics["upload_date"]
-                        if isinstance(metrics.get("upload_date"), datetime)
-                        else (
-                            datetime.fromisoformat(metrics["upload_date"].replace("Z", "+00:00"))
-                            if isinstance(metrics.get("upload_date"), str) and metrics.get("upload_date")
-                            else None
-                        )
-                    ),
-                    subscriber_count=(
-                        int(metrics["subscriber_count"])
-                        if metrics.get("subscriber_count") is not None
-                        else None
-                    ),
-                ),
-                private_metrics=PrivateMetrics(
-                    retention_at_start=(
-                        float(metrics["retention_at_start"])
-                        if metrics.get("retention_at_start") is not None
-                        else None
-                    ),
-                    retention_at_ad_start=(
-                        float(metrics["retention_at_start"])
-                        if metrics.get("retention_at_start") is not None
-                        else None
-                    ),
-                    retention_data=list(metrics.get("retention_points") or []),
-                ),
-            )
-        )
+        dashboard_items.append(_build_dashboard_item(video, metrics))
 
     await db.commit()
     return CampaignDashboardResponse(
@@ -232,6 +339,68 @@ async def get_campaign_dashboard(
         title=campaign.title,
         videos=dashboard_items,
     )
+
+
+@router.get("/{id}/videos/{video_id}/detail", response_model=VideoDetailResponse)
+async def get_video_detail(
+    id: uuid.UUID,
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideoDetailResponse:
+    """Full analytics detail for a single video."""
+    campaign = await db.get(Campaign, id)
+    if campaign is None or campaign.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign was not found.")
+
+    video = await db.scalar(
+        select(VideoMetric).where(
+            VideoMetric.campaign_id == campaign.id,
+            VideoMetric.video_id == video_id,
+        )
+    )
+    if video is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video record was not found.")
+
+    metrics = await fetch_retention_data(video.video_id, db=db, preloaded_video=video)
+    await db.commit()
+    return _build_detail_response(video, metrics)
+
+
+@router.post("/{id}/compare", response_model=list[VideoComparisonItem])
+async def compare_videos(
+    id: uuid.UUID,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[VideoComparisonItem]:
+    """Compare selected videos side-by-side."""
+    campaign = await db.get(Campaign, id)
+    if campaign is None or campaign.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign was not found.")
+
+    video_ids = payload.get("video_ids", [])
+    if not video_ids or not isinstance(video_ids, list):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="video_ids list is required.")
+
+    result = await db.execute(
+        select(VideoMetric).where(
+            VideoMetric.campaign_id == campaign.id,
+            VideoMetric.video_id.in_(video_ids),
+        )
+    )
+    videos = result.scalars().all()
+
+    comparison_items: list[VideoComparisonItem] = []
+    for video in videos:
+        try:
+            metrics = await fetch_retention_data(video.video_id, db=db, preloaded_video=video)
+        except Exception:
+            metrics = {"public_stats": {}, "metadata": {}, "views_reach": {}, "watch_time": {}, "monetization": {}, "engagement": {}, "interactive": {}, "retention_at_ad_start": None}
+        comparison_items.append(_build_comparison_item(video, metrics))
+
+    await db.commit()
+    return comparison_items
 
 
 @router.post("/{id}/videos/{video_id}/sync", response_model=DashboardVideoItem)
@@ -244,10 +413,7 @@ async def sync_video_analytics(
 ) -> DashboardVideoItem:
     campaign = await db.get(Campaign, id)
     if campaign is None or campaign.owner_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Campaign was not found.",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign was not found.")
 
     video = await db.scalar(
         select(VideoMetric).where(
@@ -256,12 +422,10 @@ async def sync_video_analytics(
         )
     )
     if video is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video record was not found.",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video record was not found.")
 
     # Parse optional date range from body
+    from datetime import date
     start_date = None
     end_date = None
     if isinstance(payload, dict):
@@ -284,7 +448,6 @@ async def sync_video_analytics(
         end_date=end_date,
     )
 
-    # If Google returned no retention points, surface a clear message to the client
     if not metrics.get("retention_points"):
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -292,50 +455,4 @@ async def sync_video_analytics(
         )
 
     await db.commit()
-
-    return DashboardVideoItem(
-        video_record_id=video.id,
-        video_id=video.video_id,
-        youtube_url=video.youtube_url,
-        duration_seconds=(
-            int(metrics["duration_seconds"])
-            if metrics.get("duration_seconds") is not None
-            else None
-        ),
-        ad_start_seconds=video.ad_start_seconds,
-        ad_end_seconds=video.ad_end_seconds,
-        is_authorized=video.is_authorized,
-        public_metrics=PublicMetrics(
-            total_views=(int(metrics["total_views"]) if metrics.get("total_views") is not None else None),
-            likes=(int(metrics["likes"]) if metrics.get("likes") is not None else None),
-            comments=(int(metrics["comments"]) if metrics.get("comments") is not None else None),
-            favorites=(int(metrics["favorites"]) if metrics.get("favorites") is not None else None),
-            upload_date=(
-                metrics["upload_date"]
-                if isinstance(metrics.get("upload_date"), datetime)
-                else (
-                    datetime.fromisoformat(metrics["upload_date"].replace("Z", "+00:00"))
-                    if isinstance(metrics.get("upload_date"), str) and metrics.get("upload_date")
-                    else None
-                )
-            ),
-            subscriber_count=(
-                int(metrics["subscriber_count"])
-                if metrics.get("subscriber_count") is not None
-                else None
-            ),
-        ),
-        private_metrics=PrivateMetrics(
-            retention_at_start=(
-                float(metrics["retention_at_start"])
-                if metrics.get("retention_at_start") is not None
-                else None
-            ),
-            retention_at_ad_start=(
-                float(metrics["retention_at_start"])
-                if metrics.get("retention_at_start") is not None
-                else None
-            ),
-            retention_data=list(metrics.get("retention_points") or []),
-        ),
-    )
+    return _build_dashboard_item(video, metrics)

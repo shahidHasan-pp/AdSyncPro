@@ -16,6 +16,7 @@ class CampaignRead(BaseModel):
     id: uuid.UUID
     owner_id: uuid.UUID
     title: str
+    video_quantity: int = 0
     created_at: datetime
 
 

@@ -24,8 +24,18 @@ class VideoMetric(Base):
     ad_start_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     ad_end_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Frequently-accessed top-level columns (denormalized from retention_json)
+    title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    channel_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_views: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     subscriber_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    upload_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Full analytics blob from YouTube APIs
     retention_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     last_updated: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_authorized: Mapped[bool] = mapped_column(
@@ -36,7 +46,3 @@ class VideoMetric(Base):
     )
 
     campaign: Mapped["Campaign"] = relationship(back_populates="videos")
-    daily_stats: Mapped[list["DailyStat"]] = relationship(
-        back_populates="video",
-        cascade="all, delete-orphan",
-    )

@@ -14,8 +14,8 @@ class Settings(BaseSettings):
 
     app_name: str = "AdSync Pro API"
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/adsync_pro"
-    google_client_secrets_file: str = "gcp_client_secret.json"
-    google_redirect_uri: str = "http://localhost:8000/auth/youtube/callback"
+    google_client_secrets_file: str = "gcp_client_secrets.json"
+    google_redirect_uri: str = "http://192.168.5.31:8000/auth/youtube/callback"
     google_token_uri: str = "https://oauth2.googleapis.com/token"
     google_client_id: str | None = None
     google_client_secret: str | None = None
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
         default_factory=lambda: [
             "https://www.googleapis.com/auth/youtube.readonly",
             "https://www.googleapis.com/auth/yt-analytics.readonly",
+            "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
         ]
     )
     fernet_key: str = Field(
@@ -33,6 +34,7 @@ class Settings(BaseSettings):
         description="Base64-encoded key from Fernet.generate_key().decode()",
     )
     retention_lookback_days: int = 30
+    youtube_analytics_data_lag_days: int = 2
 
     @property
     def sync_database_url(self) -> str:
@@ -44,4 +46,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
